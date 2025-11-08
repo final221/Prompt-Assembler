@@ -414,7 +414,23 @@ class NotificationService {
 
     /** Hides the modal and resolves the current promise. */
     _handleNotificationResponse(result) {
+        // If a prompt is active and user attempted to confirm, validate input first
+        if (this._isPromptActive && result === true) {
+            const inputEl = document.getElementById('gmpNotifyPromptInput');
+            const errEl = document.getElementById('gmpNotifyPromptError');
+            const val = inputEl?.value ?? '';
+            if (!val.trim()) {
+                if (errEl) errEl.textContent = 'Please enter a name.';
+                inputEl?.focus();
+                return; // don't close modal or resolve
+            }
+        }
+
+        // Close modal and resolve as usual
+        this._isPromptActive = false;
         this.cache.notificationModal.style.display = 'none';
+        // Clear any injected prompt UI so next modal starts fresh
+        try { if (this.cache.notifyMessage) this.cache.notifyMessage.innerHTML = ''; } catch (e) {}
         if (this.resolve) {
             this.resolve(result);
             this.resolve = null;
@@ -453,6 +469,44 @@ class NotificationService {
 
         return new Promise(resolve => {
             this.resolve = resolve;
+        });
+    }
+
+    /** Shows a non-blocking prompt dialog that returns the entered text or a cancellation marker. */
+    showPrompt(message, title = 'Input Required', placeholder = '', defaultValue = '', okLabel = 'OK', cancelLabel = 'Cancel') {
+        if (!this.cache.notificationModal) return Promise.resolve({ cancelled: true, value: '' });
+
+        this.cache.notifyTitle.textContent = title;
+        // Inject an input element into the message area so we can capture user text
+        this.cache.notifyMessage.innerHTML = '';
+        const msgDiv = document.createElement('div'); msgDiv.className = 'gmp-notify-message'; msgDiv.textContent = message;
+    const inputEl = document.createElement('input'); inputEl.id = 'gmpNotifyPromptInput'; inputEl.className = 'gmp-modal-input'; inputEl.placeholder = placeholder; inputEl.value = defaultValue || '';
+        const errEl = document.createElement('div'); errEl.id = 'gmpNotifyPromptError'; errEl.style.color = '#f28b82'; errEl.style.marginTop = '6px';
+        this.cache.notifyMessage.appendChild(msgDiv); this.cache.notifyMessage.appendChild(inputEl); this.cache.notifyMessage.appendChild(errEl);
+
+        this.cache.notifyConfirmCtn.style.display = 'flex';
+        this.cache.notifyAlertCtn.style.display = 'none';
+        this.cache.notifyConfirmOk.textContent = okLabel;
+        this.cache.notifyConfirmCancel.textContent = cancelLabel;
+
+        this.cache.notificationModal.style.display = 'flex';
+    setTimeout(() => { const el = document.getElementById('gmpNotifyPromptInput'); if (el) { el.focus(); el.select(); } }, 10);
+
+        // Mark prompt active so generic handlers can validate
+        this._isPromptActive = true;
+
+        // Clear inline error on input
+        inputEl.addEventListener('input', () => { errEl.textContent = ''; });
+
+        // Allow Enter key to attempt submit (validation occurs in _handleNotificationResponse)
+        inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); this._handleNotificationResponse(true); } });
+
+        return new Promise(resolve => {
+            // Override the generic resolver to capture input value on confirm/cancel
+            this.resolve = (confirmed) => {
+                const val = document.getElementById('gmpNotifyPromptInput')?.value ?? '';
+                resolve({ cancelled: !confirmed, value: confirmed ? val : '' });
+            };
         });
     }
 
@@ -783,9 +837,8 @@ class CoreService {
     async saveAll() {
         if (!this.state.cache.inputCtr) return;
         const {ids, partsModel} = this.state.state;
-        if (ids.length === 0) {
-            return await this.persistence.set(this.S.IDS_ORDER, []);
-        }
+        if (ids.length === 0) return await this.persistence.set(this.S.IDS_ORDER, []);
+        
         const persistOps = ids.flatMap(id => {
             const part = partsModel[id];
             if (!part) return [];
@@ -802,9 +855,8 @@ class CoreService {
         // 1. Initialize Model (Source of Truth) using the centralized factory
         this.state.state.partsModel[id] = this._createPartModel(id, partData, index);
         const part = this.state.state.partsModel[id];
-        // 2. Render UI (View)
-        this.partUIManager.createGroupUI(id, index + 1);
-        this.partUIManager.applyPartData(id, part.content, part.name, part.isCollapsed);
+    this.partUIManager.createGroupUI(id, index + 1); // 2. Render UI (View)
+    this.partUIManager.applyPartData(id, part.content, part.name, part.isCollapsed); 
     }
     loadPartsIntoUI = async (partsData) => {
         if (!this.state.cache.inputCtr) return false;
@@ -1016,16 +1068,63 @@ class ActionService {
         if (!partsData) { await this.core.saveAll(); partsData = this.core.getPartsData(); }
         if (partsData.length === 0) return this.core.flash(UI.SAVE_BUTTON, '⚠️ Prompt Empty', '#fcc459', originalText, originalColor);
 
-        // Use custom input modal for saving (not yet fully implemented in modal manager, so sticking to old prompt for now)
-        const name = prompt("Enter a name for this prompt configuration:");
-
-        if (!name?.trim()) return false;
+    // Use non-blocking prompt modal for saving to remain consistent with app UI
+    const promptResult = await this.notifications.showPrompt("Enter a name for this prompt configuration:", "Save Slot", "My Prompt Name", "Save", "Cancel");
+    if (promptResult.cancelled || !promptResult.value?.trim()) return false;
+    const name = promptResult.value.trim();
         try {
-            const key = S.SLOT_PREFIX+Date.now(); await this.persistence.set(key, partsData);
-            state.sNames[key]=name.trim(); await this.persistence.set(S.NAMES_KEY, state.sNames);
-            await this.dropdownManager.updateDropdowns(state.sNames); this.core.flash(UI.SAVE_BUTTON, `✅ Saved: ${name.substring(0,20)}...`, '#34a853', originalText, originalColor); return true;
+            // Check for existing slot with same name (case-insensitive)
+            const existingKey = Object.keys(state.sNames).find(k => (state.sNames[k] || '').toLowerCase() === name.toLowerCase());
+            let key;
+            if (existingKey) {
+                // Compute a suggested non-destructive name (Name (1), Name (2), ...)
+                const base = name;
+                const existingNames = new Set(Object.values(state.sNames).map(n => (n||'').toLowerCase()));
+                let suggested = base;
+                let idx = 1;
+                while (existingNames.has(suggested.toLowerCase())) {
+                    suggested = `${base} (${idx})`;
+                    idx++;
+                }
+
+                // Present an editable suggested name to the user (they can accept, edit, or cancel)
+                const promptEdited = await this.notifications.showPrompt(
+                    `A slot named "${name}" already exists. Edit the name or confirm to overwrite.`,
+                    'Save As',
+                    '',
+                    suggested,
+                    'Save',
+                    'Cancel'
+                );
+                if (promptEdited.cancelled) { this.core.flash(UI.SAVE_BUTTON, '⚠️ Save Cancelled', '#fcc459', originalText, originalColor); return false; }
+                const finalName = promptEdited.value.trim();
+                if (finalName.toLowerCase() === name.toLowerCase()) {
+                    // User kept the same name -> confirm overwrite
+                    const overwrite = await this.notifications.showConfirm(`Overwrite existing slot "${name}"?`, 'Confirm Overwrite');
+                    if (!overwrite) { this.core.flash(UI.SAVE_BUTTON, '⚠️ Save Cancelled', '#fcc459', originalText, originalColor); return false; }
+                    key = existingKey; // reuse existing key
+                    await this.persistence.set(key, partsData);
+                    state.sNames[key] = name;
+                } else {
+                    // User provided a different name (suggested or custom) -> save as new slot
+                    key = S.SLOT_PREFIX + Date.now();
+                    await this.persistence.set(key, partsData);
+                    state.sNames[key] = finalName;
+                }
+            } else {
+                key = S.SLOT_PREFIX + Date.now();
+                await this.persistence.set(key, partsData);
+                state.sNames[key] = name;
+            }
+
+            await this.persistence.set(S.NAMES_KEY, state.sNames);
+            await this.dropdownManager.updateDropdowns(state.sNames);
+            this.core.flash(UI.SAVE_BUTTON, '✅ Saved', '#34a853', originalText, originalColor);
+            return true;
         } catch (error) {
-            console.error('Save slot failed:', error); this.core.flash(UI.SAVE_BUTTON, '❌ Save Failed', '#f28b82', originalText, originalColor); return false;
+            console.error('Save slot failed:', error);
+            this.core.flash(UI.SAVE_BUTTON, '❌ Save Failed', '#f28b82', originalText, originalColor);
+            return false;
         }
     }
     handleDeleteSlot = async (key) => {
@@ -1195,7 +1294,6 @@ async function init() {
     // 11. Add Event Listeners
     addListeners(coreService, actionService, panelManager);
 }
-
 if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
 } else {
